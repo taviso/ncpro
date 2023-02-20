@@ -1,0 +1,383 @@
+#!/bin/bash
+#
+# TODO: Make a recursive query for list
+
+# The name of the default .ncdb file if you don't specify one.
+declare DEFAULT_DB=Notes
+
+# Where to look for .ncdb files
+declare DB_PATH="${HOME}:${HOME}/Documents:${PWD}"
+
+# Command you want to use view documents.
+# Recommended: glow
+declare VIEWER=less
+
+declare db=${DEFAULT_DB}
+
+function sqlite()
+{
+    if ! sqlite3 -readonly "${db}"; then
+        printf "sqlite returned failure\n" 1>&2
+        exit 1
+    fi
+}
+
+function sqliterw()
+{
+    if !  sqlite3 "${db}"; then
+        printf "sqlite returned failure\n" 1>&2
+        exit 1
+    fi
+}
+
+# Given a noteid, translate it into an absolute path.
+# note_absolute_path [note_id]
+function note_absolute_path()
+{
+    local query_absolute_path='
+        WITH RECURSIVE parent_note(note_title, note_pid, level) AS (
+            VALUES(NULL, "%s", 0)    -- Starting note
+            UNION ALL
+
+            SELECT notes.note_title, notes_tree.note_pid, level + 1
+            FROM notes_tree
+            NATURAL JOIN notes
+            INNER JOIN parent_note ON parent_note.note_pid = notes_tree.note_id
+        )
+        -- Turn that into a "path"
+        SELECT GROUP_CONCAT("/" || note_title, "")
+            -- This is a hack to get the list reversed
+            FROM (SELECT note_title FROM parent_note ORDER BY level DESC);
+    '
+    printf "${query_absolute_path}" "${1}" | sqlite
+}
+
+# Given a note title and a parent id, give me the note id.
+# Note: a parent id of "" means no parent.
+# find_note_id [parent_id] [note_title]
+function find_note_id()
+{
+    local result
+    local query_note_id='
+        SELECT note_id FROM notes NATURAL JOIN notes_tree
+            WHERE note_pid = "%s" AND note_title LIKE "%s";
+    '
+    result=$(printf "${query_note_id}" "${1}" "${2}" | sqlite)
+
+    # Check if that worked
+    if test -n "${result}"; then
+        printf "%s\n" "${result}"
+        return 0
+    fi
+
+    # Failed to find a note id.
+    return 1
+}
+
+# Given an absolute cracked path (e.g. /foo/bar/baz => foo bar baz) retrieve
+# the note id. Each path component should be a new parameter.
+# resolve_cracked_path [note_title...]
+function resolve_cracked_path()
+{
+    local -i i
+    local result;
+    local resolve_note_query='
+        WITH tree AS
+            (SELECT note_id,note_pid,note_title FROM notes NATURAL JOIN notes_tree)
+        SELECT note_id from tree
+            WHERE note_pid = (
+    '
+
+    if test ${#} -le 0; then
+        printf "no note names specified\n" >&2
+        exit 1
+    fi
+
+    # It's probably smarter to do this with a recursive query, but that seems hard.
+    for ((i = 0; i < ${#} - 1; i++)); do
+        resolve_note_query+="SELECT note_id from tree WHERE note_pid = ("
+    done
+
+    # root note has no parent, set it to the empty string
+    resolve_note_query+='""'
+
+    for ((i = 0; i < ${#}; i++)); do
+        resolve_note_query+=') AND note_title LIKE "%s"'
+    done
+
+    resolve_note_query+=';'
+
+    printf "${resolve_note_query}" $* | sqlite
+}
+
+
+# Given a path like /foo/bar/baz, find the note_id of baz.
+# resolve_note_path [note_path]
+function resolve_note_path()
+{
+    local IFS=/
+    local currid
+    local -i i
+    local -a path=(${1})
+    local query_unique_id='
+        SELECT note_id FROM notes WHERE note_title LIKE "%s" LIMIT 1;
+    '
+
+    # Check if this is an absolute path
+    if ! test "${1:0:1}" == "/"; then
+        # It's not absolute, so only acceptable if it's unique.
+        if is_unique "${1}"; then
+            printf "${query_unique_id}" "${1}" | sqlite
+            return $?
+        else
+            printf "The name %s is not an absolute path or unique\n" ${1}
+            return 1
+        fi
+    fi
+
+    # This was an absolute path, throw away the root entry
+    unset path[0]
+
+    # Find the note_id
+    currid=$(resolve_cracked_path ${path[*]})
+
+    # Return id to caller
+    printf "%s\n" "${currid}"
+
+    # Set the return code based on if the id is empty.
+    test -n "${currid}"
+}
+
+# Find all notes that are descendents of the specified note.
+# list_child_notes [note_id]
+function list_child_notes()
+{
+    local note
+    local query_child_notes='
+        SELECT note_id FROM notes
+        NATURAL JOIN notes_tree
+        WHERE notes_tree.note_pid = "%s";
+    '
+    local -i indent=${2:-1}
+
+    for note in $(printf "${query_child_notes}" "${1}" | sqlite); do
+        printf "%*.s%-4s%s\n" $((indent * 4)) "" "•" "$(note_absolute_path ${note})"
+        list_child_notes "${note}" $((indent + 1))
+    done
+}
+
+function count_matching_title()
+{
+    local query_count_titles='
+        SELECT COUNT(*) FROM notes WHERE note_title LIKE "%s";
+    '
+    printf "${query_count_titles}" "${1}" | sqlite
+}
+
+function is_unique()
+{
+    test $(count_matching_title "${1}") -eq 1
+}
+
+function list_toplevel_notes()
+{
+    local query_toplevel_notes='
+        SELECT (" • /"
+            || note_title
+            || " - "
+            || child_count
+        ) FROM notes
+        NATURAL JOIN notes_tree
+        NATURAL JOIN (
+            SELECT note_pid as note_id, COUNT(*) as child_count
+            FROM notes
+            NATURAL JOIN notes_tree
+            GROUP BY notes_tree.note_pid
+        )
+        WHERE notes_tree.note_pid = "";
+    '
+    if test "${1}" == ""; then
+        printf "${query_toplevel_notes}" | sqlite
+    else
+        print_note "${1}"
+    fi
+}
+
+function print_note()
+{
+    local noteid
+    local query_print_note='
+        SELECT
+            -- Try to add syntax highlighting if possible
+            (CASE WHEN syntax_highlight != "markdown"
+                THEN
+                    "```" || syntax_highlight || char(10)
+                 || note_text || char(10)
+                 || "```"
+                ELSE
+                    note_text
+             END)
+        FROM notes WHERE note_id = "%s";
+    '
+
+    if ! noteid=$(resolve_note_path "${1}"); then
+        printf "failed to resolve note name '%s'\n" "${1}" >&2
+        exit 1
+    fi
+
+    # Print the title
+    note_absolute_path "${noteid}"
+    echo
+
+    printf "${query_print_note}" "${noteid}" | sqlite | ${VIEWER:-cat} -
+
+    list_child_notes "${noteid}"
+}
+
+function find_note()
+{
+    local query_find_note='
+        WITH query AS (SELECT "%s")
+            SELECT (note_title
+                || " ..."
+                || REPLACE(SUBSTR(note_text,
+                                  INSTR(LOWER(note_text),LOWER((SELECT * FROM query))),
+                                  40),
+                           CHAR(10),
+                           " ")
+                || "..."
+            )
+            FROM notes
+            WHERE note_text like "%%" || (SELECT * FROM query) || "%%"
+                OR note_title like "%%" || (SELECT * FROM query) || "%%";
+    '
+
+    printf "${query_find_note}" "${1}" | sqlite
+}
+
+# Open the default text editor to edit note contents.
+# edit_note [note_path]
+function edit_note()
+{
+    local textfile=$(mktemp --suffix=.md)
+    local noteid
+    local cksum
+    local query_print_note='
+        SELECT note_text FROM notes WHERE note_id = "%s";
+    '
+    local query_update_note='
+        UPDATE notes SET note_text=readfile("%s") WHERE note_id = "%s";
+    '
+
+    if ! noteid=$(resolve_note_path "${1}"); then
+        printf "failed to resolve note name '%s'\n" "${1}" >&2
+        rm -f ${textfile}
+        exit 1
+    fi
+
+    printf "${query_print_note}" "${noteid}" | sqlite > ${textfile}
+
+    # record checksum of the contents
+    cksum="$(cksum ${textfile})"
+
+    if ${VISUAL:-${EDITOR:-vi}} ${textfile}; then
+        if ! test "$(cksum ${textfile})" == "${cksum}"; then
+            printf "${query_update_note}" "${textfile}" "${noteid}" | sqliterw
+        else
+            printf "The file was unchanged\n" 1>&2
+        fi
+    else
+        printf "The editor returned failure\n" 1>&2
+    fi
+
+    rm -f ${textfile}
+}
+
+function find_db_path()
+{
+    local -a _patharray
+    local -i i
+    local IFS=:
+
+    # Try to figure out what db means
+    _patharray=(${DB_PATH})
+
+    # Optionally append extension if missing
+    [[ "${db}" == *.ncdb ]] || db+=".ncdb"
+
+    for ((i = 0; i < ${#_patharray[@]}; i++)); do
+        if test -f ${_patharray[i]}/${db}; then
+            db=${_patharray[i]}/${db}
+            return
+        fi
+    done
+
+    printf "error: cannot find database %s\n" "${db}" 1>&2
+    exit 1
+}
+
+function set_syntax_markdown()
+{
+    local query_update_syntax='
+        UPDATE notes
+        SET syntax_highlight="markdown"
+        WHERE syntax_highlight = "";
+    '
+    local query_count_notes='
+        SELECT count(*) FROM notes WHERE syntax_highlight = "";
+    '
+    local -i number;
+
+    number=$(printf "${query_count_notes}" | sqlite)
+
+    if test ${number} -eq 0; then
+        printf "No update necessary.\n"
+        exit 0
+    fi
+
+    printf "${query_update_syntax}" | sqliterw
+
+    printf "%u notes updated.\n" ${number}
+    exit 0
+}
+
+function print_help()
+{
+    printf "usage: ncpro [-d database] CMD [PARAMS...]\n"
+    printf "CMD can be one of:\n"
+    printf "\tlist      - list child notes\n"
+    printf "\tprint     - print note contents\n"
+    printf "\tshow      - alias for print\n"
+    printf "\tedit      - open editor and change note\n"
+    printf "\tfind      - find notes with matching string\n"
+    printf "\tmarkdown  - set all notes without syntax to markdown\n"
+    exit 1
+}
+
+while getopts "hd:" opt; do
+    case ${opt} in
+        d) db=$OPTARG
+           ;;
+        h) print_help
+           ;;
+        *) printf "error: invalid option\n" 1>&2
+           exit 1
+           ;;
+    esac
+done
+
+shift $(($OPTIND - 1))
+
+# figure out where I should be looking
+find_db_path
+
+case "${1,,}" in
+       list) shift; list_toplevel_notes "${*}";;
+      print) shift; print_note "${*}";;
+       edit) shift; edit_note "${*}";;
+       find) shift; find_note "${*}";;
+   markdown) set_syntax_markdown;;
+       help) print_help;;
+         "") list_toplevel_notes;;
+          *) print_note "${*}";;
+esac
